@@ -1,0 +1,2 @@
+aiogram>=3.29,<4.0
+google-generativeai>=0.8.0
