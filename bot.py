@@ -6,8 +6,9 @@ import re
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatMemberStatus
-from aiogram.types import Message
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
 import google.generativeai as genai
@@ -19,6 +20,12 @@ import google.generativeai as genai
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "PUT_YOUR_GEMINI_KEY_HERE")
 GEMINI_MODEL = "gemini-2.5-flash"
+
+# Сколько предупреждений нужно набрать, чтобы получить бан
+WARN_LIMIT = 3
+
+# Права, которые бот попросит при добавлении в группу через кнопку /start
+REQUESTED_ADMIN_RIGHTS = "restrict_members,delete_messages,invite_users"
 
 BASE_DIR = Path(__file__).parent
 WARNS_FILE = BASE_DIR / "warns.json"
@@ -33,6 +40,9 @@ model = genai.GenerativeModel(GEMINI_MODEL)
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
+BOT_USERNAME: str | None = None  # заполняется при старте
+
+
 # ---------------------------------------------------------------------------
 # СЛОВАРЬ ЗАПРЕЩЁННЫХ СЛОВ (грузится из badwords.txt, по одному слову на строку)
 # ---------------------------------------------------------------------------
@@ -40,7 +50,6 @@ dp = Dispatcher()
 def load_bad_words_pattern() -> re.Pattern:
     if not BADWORDS_FILE.exists():
         log.warning("Файл %s не найден — локальный фильтр отключён", BADWORDS_FILE)
-        # Пустой паттерн, который никогда не совпадёт
         return re.compile(r"(?!x)x")
 
     words = [
@@ -82,31 +91,36 @@ def warn_key(chat_id: int, user_id: int) -> str:
     return f"{chat_id}:{user_id}"
 
 
+def add_warn(chat_id: int, user_id: int) -> int:
+    key = warn_key(chat_id, user_id)
+    warns[key] = warns.get(key, 0) + 1
+    save_warns(warns)
+    return warns[key]
+
+
+def reset_warns(chat_id: int, user_id: int) -> None:
+    warns.pop(warn_key(chat_id, user_id), None)
+    save_warns(warns)
+
+
 # ---------------------------------------------------------------------------
 # ЗАПРОС К GEMINI
 # ---------------------------------------------------------------------------
 
-PROMPT_TEMPLATE = """Ты — модератор исламского чата.
+PROMPT_TEMPLATE = """Ты — модератор чата. Тебе дано одно сообщение пользователя.
 
-Главное правило:
-Если сообщение содержит нецензурную лексику, оскорбления, унижения, насмешки или проявления ненависти, направленные в адрес Ислама, Аллаха, Пророка Мухаммада ﷺ, Корана, мечетей, мусульман (именно как религиозной группы) или исламских святынь, немедленно выдай решение BAN.
-
-Если нецензурная лексика присутствует, но она не направлена против Ислама или его святынь, не бань по этому правилу.
-
-Если сообщение обсуждает Ислам нейтрально, задает вопросы, критикует в уважительной форме или ведет академическую дискуссию без оскорблений — не бань.
-
-Другие религии (христианство, иудаизм, буддизм, индуизм и т.д.) по этому правилу не модерируются. Игнорируй оскорбления, мат или критику в их адрес.
-
-
+Определи категорию сообщения и ответь СТРОГО в одном из двух форматов,
+без каких-либо пояснений, кавычек или лишнего текста:
 
 NOTHING
-— не затрагивает религию просто сказано.
+— если в сообщении нет оскорблений/мата, ИЛИ мат есть, но направлен
+  на конкретного человека (не на религию/веру).
 
 RELIGION|<короткая причина 2-4 слова на русском>
-— если оскорбление/мат направлено на ислам, Аллаха, пророков,
-  священные тексты, конфессии, верующих как группу чисто связано про ислам.
+— если оскорбление/мат направлено на религию, веру, Бога, пророков,
+  священные тексты, конфессии, верующих как группу.
 
-Примеры причин: "оскорбление ислама", "оскорбление религии".
+Примеры причин: "оскорбление ислама", "оскорбление веры", "оскорбление религии".
 
 Сообщение пользователя:
 \"\"\"{text}\"\"\"
@@ -173,7 +187,6 @@ async def notify_creator_about_admin(chat, admin_user, reason: str, message_text
     if creator_id is None:
         return
     if creator_id == admin_user.id:
-        # Нарушитель и есть создатель — уведомлять некого
         return
 
     try:
@@ -185,22 +198,150 @@ async def notify_creator_about_admin(chat, admin_user, reason: str, message_text
             f"Сообщение: {message_text}",
         )
     except TelegramBadRequest:
-        # Создатель ни разу не писал боту в личку — Telegram не даст отправить
         log.warning(
             "Не удалось отправить ЛС создателю чата %s (%s) — он не начинал диалог с ботом",
             chat.id, creator_id,
         )
 
 
+async def ban_permanently(chat_id: int, user_id: int) -> None:
+    """Полный бан без возможности вернуться (без until_date, без unban)."""
+    await bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
+
+
+async def kick_only(chat_id: int, user_id: int) -> None:
+    """Кик: убрать из группы, но разрешить зайти обратно."""
+    await bot.ban_chat_member(chat_id, user_id)
+    await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+
+
 # ---------------------------------------------------------------------------
-# ОСНОВНОЙ ХЕНДЛЕР СООБЩЕНИЙ
+# /start — приветствие + кнопка добавления в группу
+# ---------------------------------------------------------------------------
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    if message.chat.type != "private":
+        return
+
+    add_url = (
+        f"https://t.me/{BOT_USERNAME}?startgroup=true&admin={REQUESTED_ADMIN_RIGHTS}"
+        if BOT_USERNAME else None
+    )
+
+    keyboard = None
+    if add_url:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить бота в группу", url=add_url)]]
+        )
+
+    text = (
+        "Привет! Я бот-модератор чатов.\n\n"
+        "Автоматически слежу за оскорблениями религии/веры "
+        f"(через ИИ-классификацию), выдаю предупреждения и баню после "
+        f"{WARN_LIMIT} нарушений.\n\n"
+        "Команды для админов (используются ответом на сообщение "
+        "нарушителя, в группе):\n"
+        "!ban [причина] — бан навсегда\n"
+        "!kick [причина] — исключить (сможет зайти снова)\n"
+        "!varn [причина] — выдать предупреждение "
+        f"(на {WARN_LIMIT}-м автоматически бан)\n\n"
+        "Кстати: раз вы написали мне сюда — если вы создатель чата, "
+        "теперь я смогу присылать вам сюда уведомления о нарушениях "
+        "админов группы."
+    )
+
+    await message.answer(text, reply_markup=keyboard)
+
+
+# ---------------------------------------------------------------------------
+# РУЧНЫЕ АДМИН-КОМАНДЫ: !ban / !kick / !varn
+# ---------------------------------------------------------------------------
+
+ADMIN_COMMANDS = ("!ban", "!kick", "!varn", "!warn")
+
+
+@dp.message(F.text.func(lambda t: t.lower().split()[0] in ADMIN_COMMANDS if t else False))
+async def admin_commands(message: Message):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+
+    if message.from_user is None:
+        return
+
+    chat_id = message.chat.id
+    sender_status = await get_user_status(chat_id, message.from_user.id)
+
+    if sender_status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+        await message.reply("Эта команда доступна только администраторам.")
+        return
+
+    if not message.reply_to_message or message.reply_to_message.from_user is None:
+        await message.reply(
+            "Используйте команду ответом (reply) на сообщение нарушителя."
+        )
+        return
+
+    target = message.reply_to_message.from_user
+
+    if target.is_bot:
+        await message.reply("Нельзя применить санкции к боту.")
+        return
+
+    target_status = await get_user_status(chat_id, target.id)
+    if target_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+        await message.reply(
+            "Telegram не позволяет боту банить/кикать администраторов чата."
+        )
+        return
+
+    if not await bot_can_ban(chat_id):
+        await message.reply(
+            "У меня нет прав администратора (ограничение участников) в этом чате."
+        )
+        return
+
+    cmd, _, reason = message.text.partition(" ")
+    cmd = cmd.lower()
+    reason = reason.strip() or "нарушение правил чата"
+
+    try:
+        if cmd == "!ban":
+            await ban_permanently(chat_id, target.id)
+            reset_warns(chat_id, target.id)
+            await message.reply(f"⛔ {target.full_name} забанен навсегда. Причина: {reason}")
+
+        elif cmd == "!kick":
+            await kick_only(chat_id, target.id)
+            await message.reply(f"👢 {target.full_name} исключён из чата. Причина: {reason}")
+
+        elif cmd in ("!varn", "!warn"):
+            count = add_warn(chat_id, target.id)
+            if count >= WARN_LIMIT:
+                await ban_permanently(chat_id, target.id)
+                reset_warns(chat_id, target.id)
+                await message.reply(
+                    f"⛔ {target.full_name} достиг {WARN_LIMIT} предупреждений — забанен. "
+                    f"Причина последнего: {reason}"
+                )
+            else:
+                await message.reply(
+                    f"⚠️ {target.full_name}, предупреждение {count}/{WARN_LIMIT}. "
+                    f"Причина: {reason}"
+                )
+    except TelegramBadRequest as e:
+        log.error("Не удалось выполнить команду %s: %s", cmd, e)
+        await message.reply("Не получилось выполнить действие — проверьте права бота.")
+
+
+# ---------------------------------------------------------------------------
+# АВТОМАТИЧЕСКАЯ МОДЕРАЦИЯ (ИИ-классификация + варны/бан)
 # ---------------------------------------------------------------------------
 
 @dp.message(F.text)
 async def moderate(message: Message):
     text = message.text or ""
 
-    # 1. Быстрый локальный фильтр — если мата нет, ИИ не трогаем
     if not BAD_WORDS_PATTERN.search(text):
         return
 
@@ -210,22 +351,15 @@ async def moderate(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    # 2. Классификация через Gemini
     category, reason = await classify_message(text)
 
-    if category == "NOTHING":
+    if category != "RELIGION":
         # Мат про человека или вообще не про то — ничего не делаем
         return
 
-    if category != "RELIGION":
-        return
-
-    # 3. Проверяем статус нарушителя — админа/создателя банить нельзя
     status = await get_user_status(chat_id, user_id)
 
     if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-        # Бот физически не может забанить админа/создателя чата.
-        # Вместо этого: предупреждение в чат + уведомление создателю в ЛС.
         try:
             await message.reply(
                 f"⚠️ {message.from_user.full_name}, вы администратор, но это "
@@ -235,35 +369,28 @@ async def moderate(message: Message):
             log.error("Не удалось отправить предупреждение админу: %s", e)
 
         if status == ChatMemberStatus.ADMINISTRATOR:
-            # Создателя о самом себе не уведомляем (см. notify_creator_about_admin)
             await notify_creator_about_admin(message.chat, message.from_user, reason, text)
         return
 
-    # 4. Обычный участник — работает прежняя схема варн → бан
     if not await bot_can_ban(chat_id):
         log.warning("Бот не админ или нет прав банить в чате %s", chat_id)
         return
 
-    key = warn_key(chat_id, user_id)
-    already_warned = warns.get(key, 0)
+    count = add_warn(chat_id, user_id)
 
     try:
-        if already_warned == 0:
-            # Первое нарушение — варн
-            warns[key] = 1
-            save_warns(warns)
-            await message.reply(
-                f"⚠️ Предупреждение, {message.from_user.full_name}: {reason}.\n"
-                f"При повторном нарушении — бан."
+        if count >= WARN_LIMIT:
+            await ban_permanently(chat_id, user_id)
+            reset_warns(chat_id, user_id)
+            await message.answer(
+                f"⛔️ {message.from_user.full_name} достиг {WARN_LIMIT} предупреждений "
+                f"и забанен навсегда. Причина: {reason}"
             )
         else:
-            # Повторное нарушение — бан
-            await message.chat.ban(user_id)
-            await message.answer(
-                f"⛔️ Пользователь {message.from_user.full_name} забанен: {reason} (повторно)."
+            await message.reply(
+                f"⚠️ Предупреждение {count}/{WARN_LIMIT}, {message.from_user.full_name}: "
+                f"{reason}."
             )
-            warns.pop(key, None)
-            save_warns(warns)
     except TelegramBadRequest as e:
         log.error("Не удалось выполнить действие: %s", e)
 
@@ -273,6 +400,10 @@ async def moderate(message: Message):
 # ---------------------------------------------------------------------------
 
 async def main():
+    global BOT_USERNAME
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    log.info("Бот запущен как @%s", BOT_USERNAME)
     await dp.start_polling(bot)
 
 
