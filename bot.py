@@ -17,15 +17,18 @@ from aiogram.types import (
 )
 from aiogram.exceptions import TelegramBadRequest
 
-import google.generativeai as genai
+from openai import AsyncOpenAI
 
 # ---------------------------------------------------------------------------
 # КОНФИГУРАЦИЯ
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "PUT_YOUR_GEMINI_KEY_HERE")
-GEMINI_MODEL = "gemini-2.5-flash"
+
+# Кастомный OpenAI-совместимый эндпоинт (ваш прокси)
+AI_API_KEY = os.getenv("AI_API_KEY", "sk-cdt-PUT_YOUR_KEY_HERE")
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://conduit.ozdoev.net/v1")
+AI_MODEL = os.getenv("AI_MODEL", "deepseek-v4-flash-free")
 
 # Ваш личный Telegram user_id (числовой, узнать можно у @userinfobot).
 # Только этот пользователь (плюс те, кого он добавит через /addmoder)
@@ -49,8 +52,7 @@ MODERATORS_FILE = BASE_DIR / "moderators.json"
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mod-bot")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(GEMINI_MODEL)
+ai_client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -218,10 +220,15 @@ async def classify_message(text: str) -> tuple[str, str | None]:
     """Возвращает (category, reason). category: NOTHING | RELIGION"""
     prompt = PROMPT_TEMPLATE.format(text=text)
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        raw = (response.text or "").strip()
+        response = await ai_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=30,
+        )
+        raw = (response.choices[0].message.content or "").strip()
     except Exception as e:
-        log.exception("Gemini request failed: %s", e)
+        log.exception("AI request failed: %s", e)
         return "NOTHING", None
 
     if raw.upper().startswith("RELIGION"):
